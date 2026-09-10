@@ -1,11 +1,13 @@
 # Race prediction from T-PPG features
 
 Code accompanying the ML4H Findings submission. Reproduces the main SVM
-race-classification model, the confounder-control analyses, and the
-appendix figures (mean ROC curve, pooled confusion matrix, forest plot).
+race-classification model, the confounder-control analyses, ABI-matched analysis,
+the forest plot, and the appendix figures (mean ROC curve and pooled confusion matrix).
+Because the underlying clinical dataset and proprietary preprocessing/featurization
+pipeline cannot be distributed, the script requires the analysis-ready variables described below.
 
 ## Contents
-- `analysis_code.py` — full analysis pipeline.
+- `analysis_code.py` — analysis pipeline.
 
 ## Requirements
 Python 3.9+ with `numpy`, `pandas`, `scikit-learn`, `matplotlib`.
@@ -14,7 +16,7 @@ Python 3.9+ with `numpy`, `pandas`, `scikit-learn`, `matplotlib`.
 The dataset is not publicly available due to institutional and patient
 privacy policies. Preprocessing (signal QC, featurization, cohort
 filtering) is therefore omitted. The script assumes the following
-variables are already defined in scope:
+analysis-ready variables are available:
 
 - `X`      : (n_signals, 78) DataFrame of T-PPG features
 - `y`      : (n_signals,) Series, 1 = Black, 0 = White
@@ -23,6 +25,6 @@ variables are already defined in scope:
 - `abis`   : (n_signals,) Series of ABI values
 
 ## Running
-Provide the variables above, then run `python analysis_code.py`.
-Prints pooled and per-fold AUCs, a summary table across all confounder
-controls, and displays the three appendix figures.
+Load or define the variables above before executing `analysis_code.py`.
+The script prints pooled and per-fold AUROCs, a summary table across the
+confounder-control analyses, and displays the three figures.
