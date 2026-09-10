@@ -23,6 +23,6 @@ variables are already defined in scope:
 - `abis`   : (n_signals,) Series of ABI values
 
 ## Running
-Provide the variables above, then run `python race_prediction_appendix.py`.
+Provide the variables above, then run `python analysis_code.py`.
 Prints pooled and per-fold AUCs, a summary table across all confounder
 controls, and displays the three appendix figures.
