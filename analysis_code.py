@@ -1,5 +1,7 @@
 
-# Race prediction from T-PPG features: main model and confounder controls.
+# Race prediction from T-PPG features: main model, confounder controls,
+# site-adjusted and nonlinear models, and feature-level analyses with
+# clinical covariate adjustment.
 # Site names are anonymized (Site 1, Site 2).
 
 import numpy as np
@@ -9,9 +11,10 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.svm import SVC
-from sklearn.metrics import roc_curve, auc, roc_auc_score, confusion_matrix
+from sklearn.metrics import roc_curve, auc, roc_auc_score, confusion_matrix, average_precision_score, balanced_accuracy_score
 from sklearn.utils import shuffle
-
+from sklearn.ensemble import HistGradientBoostingClassifier
+from scipy.stats import norm
 
 
 # ============================================================
@@ -26,6 +29,9 @@ from sklearn.utils import shuffle
 #   groups  : (n_signals,)    Series of patient IDs
 #   sites   : (n_signals,)    Series in {"Site 1", "Site 2"}
 #   abis    : (n_signals,)    Series of ABI values
+#   covariates : DataFrame indexed by patient ID with Age, Female,
+#                Diabetes, ESRD, EverSmoker, CurrentSmoker,
+#                SmokingUnknown (patient-level)
 # ============================================================
 
 
@@ -38,11 +44,11 @@ X, y, groups, sites, abis = shuffle(X, y, groups, sites, abis, random_state=42)
 # Patients are the sampling unit (a patient may contribute multiple
 # signals). Resampling is stratified by race. The point estimate
 # is the AUC of the original OOF predictions; bootstrap only
-# provides the CI.
+# provides the CI. Defaults to AUROC; other metrics can be passed via 'metric'.
 # ============================================================
 
 def patient_stratified_bootstrap_auc(
-    y_true, y_score, groups_in, n_boot=1000, seed=0,
+    y_true, y_score, groups_in, n_boot=1000, seed=0, metric=roc_auc_score
 ):
     y_true = np.asarray(y_true)
     y_score = np.asarray(y_score)
@@ -62,7 +68,7 @@ def patient_stratified_bootstrap_auc(
         for c in np.unique(y_true)
     }
 
-    point_auc = roc_auc_score(y_true, y_score)
+    point_auc = metric(y_true, y_score)
 
     rng = np.random.default_rng(seed)
     boot_aucs = []
@@ -77,7 +83,7 @@ def patient_stratified_bootstrap_auc(
                 replicate_indices.append(np.where(groups_in == g)[0])
         idx = np.concatenate(replicate_indices)
         try:
-            boot_aucs.append(roc_auc_score(y_true[idx], y_score[idx]))
+            boot_aucs.append(metric(y_true[idx], y_score[idx]))
         except ValueError:
             pass
 
@@ -94,6 +100,7 @@ kf = StratifiedGroupKFold(n_splits=10)
 mean_fpr = np.linspace(0, 1, 100)
 fold_tprs = []
 fold_aucs = []
+fold_coefs = []
 y_true_pooled, y_score_pooled, y_pred_pooled, groups_pooled = [], [], [], []
 
 for train_idx, test_idx in kf.split(X, y, groups=groups):
@@ -112,6 +119,7 @@ for train_idx, test_idx in kf.split(X, y, groups=groups):
         probability=True, random_state=42,
     )
     model.fit(X_train, y_train)
+    fold_coefs.append(model.coef_[0])
 
     y_score = model.predict_proba(X_test)[:, 1]
     y_pred = model.predict(X_test)
@@ -143,6 +151,23 @@ print(f"Pooled OOF AUC: {pooled_auc:.3f} "
       f"(95% CI [{pooled_lo:.3f}, {pooled_hi:.3f}])")
 print(f"Mean-of-fold AUC: {mean_fold_auc:.3f} ± {std_fold_auc:.3f}")
 
+# Secondary metrics for the class-imbalanced setting. PR-AUC is
+# reported alongside its chance level (prevalence of the positive
+# class); balanced accuracy uses the model's default threshold.
+pr_auc, pr_lo, pr_hi = patient_stratified_bootstrap_auc(
+    y_true_pooled, y_score_pooled, groups_pooled,
+    metric=average_precision_score,
+)
+bal_acc, bal_lo, bal_hi = patient_stratified_bootstrap_auc(
+    y_true_pooled, y_pred_pooled, groups_pooled,
+    metric=balanced_accuracy_score,
+)
+prevalence = y_true_pooled.mean()
+
+print(f"Pooled OOF PR-AUC: {pr_auc:.3f} "
+      f"(95% CI [{pr_lo:.3f}, {pr_hi:.3f}]; chance = {prevalence:.3f})")
+print(f"Pooled OOF balanced accuracy: {bal_acc:.3f} "
+      f"(95% CI [{bal_lo:.3f}, {bal_hi:.3f}])")
 
 # ============================================================
 # Appendix figures: mean ROC + pooled confusion matrix
@@ -158,7 +183,15 @@ plt.ylabel("True Positive Rate")
 plt.title("Mean ROC across 10 cross-validation folds")
 plt.legend()
 plt.tight_layout()
-# plt.savefig("ML4H_Results/mean_roc_300dpi.png", dpi=300, bbox_inches='tight')
+# plt.savefig("ML4H_Results/mean_roc_300dpi_cameraready.png", dpi=300, bbox_inches='tight')
+
+# gray scale version
+ax = plt.gca()
+ax.get_lines()[0].set_color("black")
+ax.get_lines()[1].set_color("gray")
+ax.legend()
+# plt.savefig("ML4H_Results/mean_roc_300dpi_cameraready-gray.png", dpi=300, bbox_inches="tight")
+
 plt.show()
 
 # Confusion matrix: raw count + row percentage per cell, with
@@ -188,15 +221,22 @@ ax.set_xlabel("Predicted race label")
 ax.set_ylabel("True race label")
 ax.set_title("Pooled out-of-fold confusion matrix")
 plt.tight_layout()
-# plt.savefig("ML4H_Results/confusion_matrix_300dpi.png", dpi=300, bbox_inches='tight')
+# plt.savefig("ML4H_Results/confusion_matrix_300dpi_cameraready.png", dpi=300, bbox_inches='tight')
+
+# gray scale version
+for im in ax.images:
+    im.set_cmap("Greys")
+# plt.savefig("ML4H_Results/confusion_matrix_300dpi_cameraready-gray.png", dpi=300, bbox_inches="tight")
+
 plt.show()
 
 
 # ============================================================
 # Confounder controls
 # ------------------------------------------------------------
-# Every row of the forest plot does: grouped CV,
-# pooled OOF predictions, patient-stratified bootstrap CI.
+# Model-based rows use grouped CV, pooled OOF predictions, and a
+# patient-stratified bootstrap CI. Single-variable controls (site,
+# ABI) are scored directly from the variable with the same bootstrap.
 # ============================================================
 
 def run_svm_cv_pooled(X_in, y_in, groups_in, n_splits=10, random_state=42):
@@ -238,15 +278,17 @@ def evaluate_pooled_model(X_in, y_in, groups_in, n_splits=10):
 
 results = [("PPG features (all sites)", pooled_auc, pooled_lo, pooled_hi)]
 
-# Site alone (one-hot, no PPG features).
-X_site = pd.get_dummies(
-    pd.Series(sites).reset_index(drop=True), drop_first=True,
-).astype(float)
-results.append(("Site only", *evaluate_pooled_model(X_site, y, groups)))
+# Single-variable controls: AUROC computed directly from the variable
+# (no classifier), since a model on one variable reduces to a monotone
+# transform of it. Site 1 and lower ABI are scored toward Black.
+# CIs use the same patient-level stratified bootstrap.
+site_score = (np.asarray(sites) == "Site 1").astype(float)
+results.append(("Site only",
+                *patient_stratified_bootstrap_auc(y, site_score, groups)))
 
-# ABI alone.
-X_abi = pd.DataFrame({'ABI': np.asarray(abis)})
-results.append(("ABI only", *evaluate_pooled_model(X_abi, y, groups)))
+abi_score = -np.asarray(abis)
+results.append(("ABI only",
+                *patient_stratified_bootstrap_auc(y, abi_score, groups)))
 
 # Per-site PPG-feature models. Reduced subsets use 5 folds.
 for site_name in ["Site 1", "Site 2"]:
@@ -326,6 +368,87 @@ results.append((
 ))
 
 
+
+# ============================================================
+# PPG + site vs. site only
+# ------------------------------------------------------------
+# Tests whether the PPG features add race-predictive information
+# beyond acquisition site. A site indicator is appended to the
+# 78 PPG features and evaluated with the standard pipeline. The
+# difference vs. site only uses a paired patient-level bootstrap
+# (both scores evaluated on the same resampled patients).
+# ============================================================
+
+def patient_stratified_bootstrap_auc_diff(
+    y_true, score_a, score_b, groups_in, n_boot=1000, seed=0,
+):
+    """Paired bootstrap CI for AUC(score_a) - AUC(score_b)."""
+    y_true = np.asarray(y_true)
+    score_a = np.asarray(score_a)
+    score_b = np.asarray(score_b)
+    groups_in = np.asarray(groups_in)
+
+    unique_groups = np.unique(groups_in)
+    group_to_class = {g: y_true[groups_in == g][0] for g in unique_groups}
+    groups_by_class = {
+        c: np.array([g for g in unique_groups if group_to_class[g] == c])
+        for c in np.unique(y_true)
+    }
+
+    point_diff = roc_auc_score(y_true, score_a) - roc_auc_score(y_true, score_b)
+
+    rng = np.random.default_rng(seed)
+    boot_diffs = []
+    for _ in range(n_boot):
+        replicate_indices = []
+        for c in sorted(groups_by_class.keys()):
+            sampled = rng.choice(
+                groups_by_class[c], size=len(groups_by_class[c]), replace=True,
+            )
+            for g in sampled:
+                replicate_indices.append(np.where(groups_in == g)[0])
+        idx = np.concatenate(replicate_indices)
+        boot_diffs.append(
+            roc_auc_score(y_true[idx], score_a[idx])
+            - roc_auc_score(y_true[idx], score_b[idx])
+        )
+
+    boot_diffs = np.asarray(boot_diffs)
+    return point_diff, np.percentile(boot_diffs, 2.5), np.percentile(boot_diffs, 97.5)
+
+
+# PPG features + site indicator (Site 1 as reference).
+X_ppg_site = X.reset_index(drop=True).copy()
+X_ppg_site["Site 2"] = (np.asarray(sites) == "Site 2").astype(float)
+
+yt_ps, ys_ps, gs_ps = run_svm_cv_pooled(X_ppg_site, y, groups)
+ppg_site_auc, ppg_site_lo, ppg_site_hi = patient_stratified_bootstrap_auc(
+    yt_ps, ys_ps, gs_ps,
+)
+
+# Align site-only scores to the pooled OOF order (same deterministic split).
+oof_idx = np.concatenate([
+    te for _, te in StratifiedGroupKFold(n_splits=10).split(
+        X_ppg_site, y.reset_index(drop=True), groups=groups.reset_index(drop=True),
+    )
+])
+assert np.array_equal(np.asarray(y)[oof_idx], yt_ps)
+assert np.array_equal(np.asarray(groups)[oof_idx], gs_ps)
+site_score_oof = site_score[oof_idx]
+
+diff, diff_lo, diff_hi = patient_stratified_bootstrap_auc_diff(
+    yt_ps, ys_ps, site_score_oof, gs_ps,
+)
+
+print("\nPPG + site vs. site only")
+print(f"  PPG + site:  {ppg_site_auc:.3f}  [{ppg_site_lo:.3f}, {ppg_site_hi:.3f}]")
+print(f"  Site only:   {roc_auc_score(yt_ps, site_score_oof):.3f}")
+print(f"  Difference:  {diff:+.3f}  [{diff_lo:+.3f}, {diff_hi:+.3f}]")
+
+results.insert(2, ("PPG features + site", ppg_site_auc, ppg_site_lo, ppg_site_hi))
+
+
+
 # ============================================================
 # Summary table
 # ============================================================
@@ -360,5 +483,269 @@ ax.legend(loc='lower right', frameon=False)
 ax.grid(axis='x', alpha=0.3)
 plt.tight_layout()
 
-# plt.savefig("ML4H_Results/race_confounder_forest_300dpi_final.png", dpi=300, bbox_inches='tight')
+# plt.savefig("ML4H_Results/race_confounder_forest_300dpi_cameraready.png", dpi=300, bbox_inches='tight')
+
+# gray scale version
+for line in ax.get_lines():
+    if line.get_color() == "red":
+        line.set_color("black")
+ax.legend(loc='lower right', frameon=False)
+# plt.savefig("ML4H_Results/race_confounder_forest_300dpi_cameraready-gray.png", dpi=300, bbox_inches="tight")
+
 plt.show()
+
+
+# ============================================================
+# Nonlinear probe: gradient-boosted trees
+# ------------------------------------------------------------
+# Tests whether a more flexible model extracts more race
+# information from the same 78 features than the linear SVM.
+# Same grouped 10-fold CV and patient-level bootstrap. Trees do
+# not require feature scaling; class weighting mirrors the SVM.
+# Default hyperparameters.
+# ============================================================
+
+
+def run_gbm_cv_pooled(X_in, y_in, groups_in, n_splits=10, random_state=42):
+    """Grouped CV with gradient-boosted trees; returns pooled OOF (y_true, y_score, groups)."""
+    X_in = X_in.reset_index(drop=True)
+    y_in = pd.Series(y_in).reset_index(drop=True)
+    groups_in = pd.Series(groups_in).reset_index(drop=True)
+
+    kf_local = StratifiedGroupKFold(n_splits=n_splits)
+    y_true, y_score, groups_out = [], [], []
+    for tr, te in kf_local.split(X_in, y_in, groups=groups_in):
+        m = HistGradientBoostingClassifier(
+            class_weight='balanced', random_state=random_state,
+        )
+        m.fit(X_in.iloc[tr], y_in.iloc[tr])
+        y_true.extend(y_in.iloc[te].values)
+        y_score.extend(m.predict_proba(X_in.iloc[te])[:, 1])
+        groups_out.extend(groups_in.iloc[te].values)
+    return np.asarray(y_true), np.asarray(y_score), np.asarray(groups_out)
+
+
+gbm_auc, gbm_lo, gbm_hi = patient_stratified_bootstrap_auc(
+    *run_gbm_cv_pooled(X, y, groups),
+)
+print(f"\nGradient-boosted trees (all sites): "
+      f"AUROC {gbm_auc:.3f} [{gbm_lo:.3f}, {gbm_hi:.3f}]")
+
+
+# ============================================================
+# Feature-level analysis
+# ------------------------------------------------------------
+# (1) Per-feature standardized mean difference (SMD, Black minus
+#     White) on patient-level feature means, computed within each
+#     site and combined across sites by inverse-variance weighting,
+#     so that site imbalance is not mistaken for a race difference.
+#     P-values are Benjamini-Hochberg FDR-corrected across the 78
+#     features.
+# (2) Main-model linear SVM coefficients averaged over the 10 folds
+#     (features are standardized, so magnitudes are comparable).
+# Positive values indicate higher in / weighted toward Black.
+# ============================================================
+
+
+def site_smd(feats_in, y_in, groups_in):
+    """Patient-level SMD (Black - White) per feature, with its variance."""
+    df = feats_in.reset_index(drop=True).copy()
+    df["_y"] = np.asarray(y_in)
+    df["_g"] = np.asarray(groups_in)
+
+    # Average each patient's signals so patients are the unit of analysis.
+    patient_means = df.groupby("_g").mean()
+    black = patient_means[patient_means["_y"] == 1].drop(columns="_y")
+    white = patient_means[patient_means["_y"] == 0].drop(columns="_y")
+    n1, n0 = len(black), len(white)
+
+    pooled_sd = np.sqrt(
+        ((n1 - 1) * black.var() + (n0 - 1) * white.var()) / (n1 + n0 - 2)
+    )
+    d = (black.mean() - white.mean()) / pooled_sd
+    var_d = (n1 + n0) / (n1 * n0) + d**2 / (2 * (n1 + n0))
+    return d, var_d, n1, n0
+
+
+def benjamini_hochberg(p_values):
+    """Benjamini-Hochberg FDR-adjusted q-values."""
+    p = np.asarray(p_values)
+    n = len(p)
+    order = np.argsort(p)
+    ranked = p[order] * n / np.arange(1, n + 1)
+    q_sorted = np.minimum.accumulate(ranked[::-1])[::-1]
+    q = np.empty(n)
+    q[order] = np.minimum(q_sorted, 1.0)
+    return q
+
+
+def residualize(feats_in, covariate_in):
+    """Remove the linear effect of one or more covariates from each feature."""
+    F = feats_in.to_numpy(dtype=float)
+    C = np.asarray(covariate_in, dtype=float)
+    if C.ndim == 1:
+        C = C[:, None]
+    Z = np.column_stack([np.ones(len(F)), C])
+    beta, *_ = np.linalg.lstsq(Z, F, rcond=None)
+    return pd.DataFrame(F - Z @ beta, columns=feats_in.columns)
+
+
+def combined_site_smd(feats_in, y_in, groups_in, sites_in, adjust_for=None):
+    """Within-site patient-level SMDs combined across sites by
+    inverse-variance weighting, with BH-adjusted q-values. If
+    adjust_for is given, features are first residualized on that
+    covariate within each site."""
+    sites_arr = np.asarray(sites_in)
+    smd_by_site, var_by_site = {}, {}
+    for site_name in ["Site 1", "Site 2"]:
+        mask = sites_arr == site_name
+        feats_site = feats_in.iloc[mask].reset_index(drop=True)
+        if adjust_for is not None:
+            feats_site = residualize(feats_site, np.asarray(adjust_for)[mask])
+        d, var_d, _, _ = site_smd(
+            feats_site, np.asarray(y_in)[mask], np.asarray(groups_in)[mask],
+        )
+        smd_by_site[site_name] = d.reindex(feats_in.columns)
+        var_by_site[site_name] = var_d.reindex(feats_in.columns)
+
+    w1 = 1 / var_by_site["Site 1"]
+    w2 = 1 / var_by_site["Site 2"]
+    smd_combined = (w1 * smd_by_site["Site 1"] + w2 * smd_by_site["Site 2"]) / (w1 + w2)
+    se_combined = np.sqrt(1 / (w1 + w2))
+    p_combined = 2 * norm.sf(np.abs(smd_combined / se_combined))
+    return smd_by_site, smd_combined, benjamini_hochberg(p_combined)
+
+
+feature_names = X.columns
+
+# (1) Within-site SMDs, combined across sites.
+smd_by_site, smd_combined, q_combined = combined_site_smd(X, y, groups, sites)
+
+# (2) Fold-averaged SVM coefficients from the main model.
+mean_coef = pd.Series(np.mean(fold_coefs, axis=0), index=feature_names)
+coef_rank = mean_coef.abs().rank(ascending=False).astype(int)
+
+feature_table = pd.DataFrame({
+    "SMD Site 1": smd_by_site["Site 1"].values,
+    "SMD Site 2": smd_by_site["Site 2"].values,
+    "SMD combined": smd_combined.values,
+    "q (FDR)": q_combined,
+    "SVM coef": mean_coef.values,
+    "Coef rank": coef_rank.values,
+}, index=feature_names)
+feature_table = feature_table.reindex(
+    feature_table["SMD combined"].abs().sort_values(ascending=False).index
+)
+
+n_sig = (feature_table["q (FDR)"] < 0.05).sum()
+top10_smd = set(feature_table.index[:10])
+top10_coef = set(coef_rank[coef_rank <= 10].index)
+
+print(f"\nFeatures with FDR q < 0.05: {n_sig} of {len(feature_names)}")
+print(f"Overlap of top-10 by |SMD| and top-10 by |SVM coef|: "
+      f"{len(top10_smd & top10_coef)} of 10")
+print("\nTop 10 features by |combined SMD|")
+print(feature_table.head(10).to_string(float_format=lambda v: f"{v:.3f}"))
+
+# feature_table.to_csv("ML4H_Results/feature_level_analysis.csv")
+
+# ------------------------------------------------------------
+# ABI-adjusted SMDs: features are residualized on ABI within
+# each site before computing patient-level SMDs, testing whether
+# race differences in the features reflect PAD severity.
+# ------------------------------------------------------------
+_, smd_combined_abi, q_combined_abi = combined_site_smd(
+    X, y, groups, sites, adjust_for=abis,
+)
+smd_combined_abi = smd_combined_abi.reindex(feature_table.index)
+q_combined_abi = pd.Series(q_combined_abi, index=X.columns).reindex(feature_table.index)
+
+feature_table["SMD combined (ABI-adj)"] = smd_combined_abi.values
+feature_table["q (ABI-adj)"] = q_combined_abi.values
+
+n_sig_abi = (feature_table["q (ABI-adj)"] < 0.05).sum()
+shrinkage = (feature_table["SMD combined (ABI-adj)"].abs()
+             / feature_table["SMD combined"].abs()).median()
+
+print(f"\nABI-adjusted: features with FDR q < 0.05: {n_sig_abi} of {len(X.columns)}")
+print(f"Median |SMD| retained after ABI adjustment: {shrinkage:.0%}")
+print("\nTop 10 features (by unadjusted |SMD|): unadjusted vs. ABI-adjusted")
+print(feature_table.head(10)[[
+    "SMD combined", "q (FDR)", "SMD combined (ABI-adj)", "q (ABI-adj)",
+]].to_string(float_format=lambda v: f"{v:.3f}"))
+
+
+# ============================================================
+# Clinical covariates
+# ------------------------------------------------------------
+# (1) Patient-level descriptive comparison by race, overall and
+#     within each site.
+# (2) Feature SMDs adjusted for ABI, age, sex, diabetes, ESRD, and smoking
+#     within site (extends the ABI-adjusted analysis above).
+# Covariates are patient-level (mean age across measurements;
+# comorbidities ever recorded).
+# ============================================================
+
+sites_arr = np.asarray(sites)
+y_arr = np.asarray(y)
+g_arr = np.asarray(groups)
+
+
+def describe_patients(patient_ids):
+    c = covariates.loc[patient_ids]
+    return pd.Series({
+        "Patients": f"{len(c)}",
+        "Age, mean (SD)": f"{c['Age'].mean():.1f} ({c['Age'].std():.1f})",
+        "Female, %": f"{100 * c['Female'].mean():.1f}",
+        "Diabetes, %": f"{100 * c['Diabetes'].mean():.1f}",
+        "ESRD, %": f"{100 * c['ESRD'].mean():.1f}",
+        "Ever smoker, %": f"{100 * c['EverSmoker'].mean():.1f}",
+        "Current smoker, %": f"{100 * c['CurrentSmoker'].mean():.1f}",
+        "Smoking unknown, %": f"{100 * c['SmokingUnknown'].mean():.1f}",
+    })
+
+
+# (1) Descriptive table.
+desc = {}
+for site_label, site_mask in [
+    ("All sites", np.ones(len(y_arr), dtype=bool)),
+    ("Site 1", sites_arr == "Site 1"),
+    ("Site 2", sites_arr == "Site 2"),
+]:
+    for race_label, race_val in [("White", 0), ("Black", 1)]:
+        ids = np.unique(g_arr[site_mask & (y_arr == race_val)])
+        desc[(site_label, race_label)] = describe_patients(ids)
+
+print("\nPatient characteristics by race and site")
+print(pd.DataFrame(desc).to_string())
+
+# Signal-level adjustment covariates (ABI + patient-level clinical).
+adjusters = pd.concat([
+    pd.Series(np.asarray(abis, dtype=float), name="ABI"),
+    covariates.loc[g_arr].reset_index(drop=True),
+], axis=1)
+
+# (2) Covariate-adjusted SMDs.
+_, smd_combined_cov, q_combined_cov = combined_site_smd(
+    X, y, groups, sites, adjust_for=adjusters,
+)
+feature_table["SMD combined (ABI+clin-adj)"] = (
+    smd_combined_cov.reindex(feature_table.index).values
+)
+feature_table["q (ABI+clin-adj)"] = (
+    pd.Series(q_combined_cov, index=X.columns).reindex(feature_table.index).values
+)
+
+n_sig_cov = (feature_table["q (ABI+clin-adj)"] < 0.05).sum()
+retained_cov = (feature_table["SMD combined (ABI+clin-adj)"].abs()
+                / feature_table["SMD combined"].abs()).median()
+
+print(f"\nABI + clinical adjusted: features with FDR q < 0.05: "
+      f"{n_sig_cov} of {len(X.columns)}")
+print(f"Median |SMD| retained after ABI + clinical adjustment: {retained_cov:.0%}")
+print("\nTop 10 features (by unadjusted |SMD|)")
+print(feature_table.head(10)[[
+    "SMD combined", "SMD combined (ABI-adj)",
+    "SMD combined (ABI+clin-adj)", "q (ABI+clin-adj)",
+]].to_string(float_format=lambda v: f"{v:.3f}"))
+
